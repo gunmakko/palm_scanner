@@ -9,6 +9,8 @@ HTML 1 ファイルで動作し、外部ライブラリは使っていません�
 
 GitHub Pages で公開しています。
 
+https://gunmakko.github.io/palm_scanner/
+
 iPad の Safari で開き、共有ボタン →「ホーム画面に追加」するとアドレスバーなしのフルスクリーンで起動します。
 
 ## 動作
