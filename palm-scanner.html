@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#04080d">
+<title>Palm Scanner</title>
+<style>
+  :root {
+    --bg: #04080d;
+    --cyan: #3fe4ff;
+    --cyan-dim: rgba(63,228,255,.18);
+    --green: #5dffb0;
+    --red: #ff5f6d;
+    --text: #d9f6ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: var(--bg);
+    overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: none;
+    overscroll-behavior: none;
+    font-family: "SF Mono", Menlo, "Courier New", monospace;
+    color: var(--text);
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #ui {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    justify-content: space-between;
+    padding: max(24px, env(safe-area-inset-top)) 28px max(28px, env(safe-area-inset-bottom));
+    pointer-events: none;
+  }
+  #top { display: flex; justify-content: space-between; font-size: 13px; letter-spacing: .12em; opacity: .55; }
+  #status {
+    text-align: center;
+    font-size: 15px; letter-spacing: .3em;
+    transition: color .25s, opacity .25s;
+  }
+  #status.big { font-size: 34px; letter-spacing: .5em; font-weight: 600; }
+  #status.granted { color: var(--green); text-shadow: 0 0 24px rgba(93,255,176,.8); }
+  #status.denied  { color: var(--red);   text-shadow: 0 0 24px rgba(255,95,109,.8); }
+  #status.scanning { color: var(--cyan); }
+  #log {
+    position: fixed; left: 28px; bottom: max(64px, env(safe-area-inset-bottom));
+    font-size: 11px; line-height: 1.7; opacity: .45; letter-spacing: .06em;
+    white-space: pre; pointer-events: none;
+  }
+  #flash {
+    position: fixed; inset: 0; pointer-events: none;
+    background: var(--green); opacity: 0;
+  }
+  #flash.on { animation: flash .6s ease-out forwards; }
+  @keyframes flash { 0% { opacity: .35; } 100% { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { #flash.on { animation: none; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="flash"></div>
+<div id="ui">
+  <div id="top"><span>BIOMETRIC GATE 07</span><span id="clock"></span></div>
+  <div id="status">手のひらを画面に置いてください</div>
+</div>
+<div id="log"></div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const flashEl = document.getElementById('flash');
+  const clockEl = document.getElementById('clock');
+
+  const SCAN_MS = 2600;      // スキャンにかかる時間
+  const RESULT_MS = 2800;    // 結果表示の時間
+  const DENY_RATE = 0.0;     // 0.15 にすると15%で「拒否」演出になる
+
+  let W, H, dpr;
+  let state = 'idle';        // idle | scanning | granted | denied | aborted
+  let t0 = 0, resultUntil = 0;
+  let touches = [];          // {x, y, id}
+  let lastTick = -1;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- 音 ----------
+  let ac = null;
+  function audio() {
+    if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (ac.state === 'suspended') ac.resume();
+    return ac;
+  }
+  function tone(freq, dur, type = 'sine', gain = 0.06, when = 0) {
+    try {
+      const a = audio();
+      const o = a.createOscillator(), g = a.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(0, a.currentTime + when);
+      g.gain.linearRampToValueAtTime(gain, a.currentTime + when + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + when + dur);
+      o.connect(g); g.connect(a.destination);
+      o.start(a.currentTime + when); o.stop(a.currentTime + when + dur + 0.05);
+    } catch (e) {}
+  }
+
+  // ---------- ログ ----------
+  const lines = [];
+  function log(s) {
+    lines.push(s);
+    while (lines.length > 7) lines.shift();
+    logEl.textContent = lines.join('\n');
+  }
+  const hex = n => Array.from({length: n}, () => Math.floor(Math.random() * 16).toString(16).toUpperCase()).join('');
+
+  // ---------- 状態遷移 ----------
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || '';
+  }
+  function startScan() {
+    state = 'scanning'; t0 = performance.now(); lastTick = -1;
+    lines.length = 0;
+    setStatus('スキャン中', 'scanning');
+    log('SESSION ' + hex(8));
+    log('CONTACT DETECTED ' + touches.length + ' pt');
+    tone(880, 0.08, 'square', 0.03);
+  }
+  function finishScan() {
+    const ok = Math.random() >= DENY_RATE;
+    state = ok ? 'granted' : 'denied';
+    resultUntil = performance.now() + RESULT_MS;
+    if (ok) {
+      setStatus('認証完了', 'big granted');
+      flashEl.classList.remove('on'); void flashEl.offsetWidth; flashEl.classList.add('on');
+      tone(1046, 0.18, 'sine', 0.08); tone(1568, 0.35, 'sine', 0.08, 0.12);
+      log('MATCH 99.' + Math.floor(Math.random() * 90 + 10) + '%');
+      log('ACCESS GRANTED');
+    } else {
+      setStatus('認証失敗', 'big denied');
+      tone(220, 0.25, 'sawtooth', 0.06); tone(180, 0.35, 'sawtooth', 0.06, 0.2);
+      log('MATCH 12.' + Math.floor(Math.random() * 90 + 10) + '%');
+      log('ACCESS DENIED');
+    }
+  }
+  function abortScan() {
+    state = 'aborted';
+    resultUntil = performance.now() + 1200;
+    setStatus('中断 — 手を離さないでください', 'denied');
+    tone(300, 0.15, 'square', 0.04);
+    log('CONTACT LOST');
+  }
+  function toIdle() {
+    state = 'idle';
+    setStatus('手のひらを画面に置いてください', '');
+  }
+
+  // ---------- タッチ ----------
+  function readTouches(e) {
+    touches = Array.from(e.touches).map(t => ({ x: t.clientX, y: t.clientY, id: t.identifier }));
+  }
+  cv.addEventListener('touchstart', e => {
+    e.preventDefault(); readTouches(e);
+    audio();
+    if (state === 'idle') startScan();
+  }, { passive: false });
+  cv.addEventListener('touchmove', e => { e.preventDefault(); readTouches(e); }, { passive: false });
+  const onEnd = e => {
+    e.preventDefault(); readTouches(e);
+    if (state === 'scanning' && touches.length === 0) abortScan();
+  };
+  cv.addEventListener('touchend', onEnd, { passive: false });
+  cv.addEventListener('touchcancel', onEnd, { passive: false });
+
+  // マウスでも一応動く（PCで確認する用）
+  let mouseDown = false;
+  cv.addEventListener('mousedown', e => { mouseDown = true; touches = [{x: e.clientX, y: e.clientY, id: 0}]; audio(); if (state === 'idle') startScan(); });
+  cv.addEventListener('mousemove', e => { if (mouseDown) touches = [{x: e.clientX, y: e.clientY, id: 0}]; });
+  window.addEventListener('mouseup', () => { mouseDown = false; touches = []; if (state === 'scanning') abortScan(); });
+
+  // ---------- 描画 ----------
+  const HAND = new Path2D(
+    'M100 258 C64 258 42 232 42 196 L42 118 C42 106 58 106 58 118 L58 160 ' +
+    'L50 66 C49 54 66 52 67 64 L75 158 L74 30 C74 18 92 18 92 30 L94 156 ' +
+    'L102 22 C103 10 121 12 120 24 L114 158 L130 52 C132 40 149 44 147 56 ' +
+    'L132 166 L156 132 C162 124 176 132 170 142 L142 200 C134 234 128 258 100 258 Z'
+  );
+
+  function drawGrid() {
+    ctx.strokeStyle = 'rgba(63,228,255,.06)';
+    ctx.lineWidth = 1;
+    const s = 48;
+    ctx.beginPath();
+    for (let x = (W / 2) % s; x < W; x += s) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = (H / 2) % s; y < H; y += s) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+  }
+
+  function drawHand(now, alpha) {
+    const scale = Math.min(W, H) / 420;
+    ctx.save();
+    ctx.translate(W / 2 - 100 * scale, H / 2 - 140 * scale);
+    ctx.scale(scale, scale);
+    ctx.lineWidth = 2 / scale;
+    ctx.strokeStyle = `rgba(63,228,255,${alpha})`;
+    ctx.shadowColor = 'rgba(63,228,255,.9)';
+    ctx.shadowBlur = 18;
+    ctx.setLineDash([6, 5]);
+    ctx.lineDashOffset = -now / 40;
+    ctx.stroke(HAND);
+    ctx.restore();
+  }
+
+  function drawContacts(now) {
+    for (const t of touches) {
+      const r = 26 + Math.sin(now / 120 + t.id) * 3;
+      ctx.beginPath(); ctx.arc(t.x, t.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(63,228,255,.9)'; ctx.lineWidth = 1.5;
+      ctx.shadowColor = 'rgba(63,228,255,1)'; ctx.shadowBlur = 14;
+      ctx.stroke();
+      ctx.beginPath(); ctx.arc(t.x, t.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = 'var(--cyan)'; ctx.fillStyle = '#3fe4ff'; ctx.fill();
+      ctx.shadowBlur = 0;
+      // 十字線
+      ctx.strokeStyle = 'rgba(63,228,255,.35)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(t.x - r - 14, t.y); ctx.lineTo(t.x - r, t.y);
+      ctx.moveTo(t.x + r, t.y); ctx.lineTo(t.x + r + 14, t.y);
+      ctx.moveTo(t.x, t.y - r - 14); ctx.lineTo(t.x, t.y - r);
+      ctx.moveTo(t.x, t.y + r); ctx.lineTo(t.x, t.y + r + 14);
+      ctx.stroke();
+    }
+    // 接点同士を結ぶ
+    if (touches.length > 1) {
+      ctx.strokeStyle = 'rgba(63,228,255,.18)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 0; i < touches.length; i++)
+        for (let j = i + 1; j < touches.length; j++) {
+          ctx.moveTo(touches[i].x, touches[i].y); ctx.lineTo(touches[j].x, touches[j].y);
+        }
+      ctx.stroke();
+    }
+  }
+
+  function drawScanBar(p) {
+    const y = p * H;
+    const g = ctx.createLinearGradient(0, y - 90, 0, y);
+    g.addColorStop(0, 'rgba(63,228,255,0)');
+    g.addColorStop(1, 'rgba(63,228,255,.28)');
+    ctx.fillStyle = g; ctx.fillRect(0, y - 90, W, 90);
+    ctx.fillStyle = '#9ff1ff';
+    ctx.shadowColor = '#3fe4ff'; ctx.shadowBlur = 22;
+    ctx.fillRect(0, y - 1.5, W, 3);
+    ctx.shadowBlur = 0;
+    // 進捗
+    ctx.fillStyle = 'rgba(217,246,255,.7)';
+    ctx.font = '12px "SF Mono", Menlo, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(String(Math.floor(p * 100)).padStart(3, ' ') + '%', W - 28, y - 8);
+    ctx.textAlign = 'left';
+  }
+
+  function drawRing(now, color) {
+    const r = Math.min(W, H) * 0.36;
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(now / 3000);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.setLineDash([r * 0.6, r * 0.25]);
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.rotate(-now / 1500);
+    ctx.setLineDash([12, 18]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(0, 0, r + 22, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
+
+  function frame(now) {
+    ctx.clearRect(0, 0, W, H);
+    drawGrid();
+
+    if (state === 'idle') {
+      const pulse = 0.35 + 0.25 * (0.5 + 0.5 * Math.sin(now / 700));
+      drawRing(now, 'rgba(63,228,255,.25)');
+      drawHand(now, pulse);
+    } else if (state === 'scanning') {
+      const p = Math.min(1, (now - t0) / SCAN_MS);
+      drawRing(now, 'rgba(63,228,255,.55)');
+      drawHand(now, 0.9);
+      drawContacts(now);
+      drawScanBar(p);
+      const tick = Math.floor(p * 10);
+      if (tick !== lastTick) {
+        lastTick = tick;
+        tone(600 + tick * 60, 0.05, 'square', 0.02);
+        if (tick % 2 === 0) log('SEG ' + String(tick).padStart(2, '0') + '  ' + hex(12));
+      }
+      if (p >= 1) finishScan();
+    } else {
+      const col = state === 'granted' ? 'rgba(93,255,176,.7)' : 'rgba(255,95,109,.7)';
+      drawRing(now, col);
+      ctx.save();
+      ctx.globalAlpha = 0.9;
+      const scale = Math.min(W, H) / 420;
+      ctx.translate(W / 2 - 100 * scale, H / 2 - 140 * scale); ctx.scale(scale, scale);
+      ctx.lineWidth = 2 / scale; ctx.strokeStyle = col;
+      ctx.shadowColor = col; ctx.shadowBlur = 20;
+      ctx.stroke(HAND);
+      ctx.restore();
+      if (state !== 'aborted') drawContacts(now);
+      if (now > resultUntil) toIdle();
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // 時計
+  setInterval(() => {
+    const d = new Date();
+    clockEl.textContent = d.toTimeString().slice(0, 8);
+  }, 500);
+})();
+</script>
+</body>
+</html>
